@@ -2,30 +2,11 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-把你渲染好的一帧，直接作为 **PipeWire 视频节点**发布成 OBS 的源。
-
-没有浏览器、没有 CEF、没有 HTTP、渲染侧不需要装任何插件：一个很小的 C++ 静态库，注册
-`Stream/Output/Video` 节点，并在 [obs-pwvideo](https://github.com/tasokait/obs-pwvideo)
-每拉一帧时回调你。它是
-[pw-mpris-visualcard](https://github.com/zlinux-live-util/pw-mpris-visualcard) 的输出侧，
-被单独拆出来是因为难点从来不是渲染，而是 PipeWire 那四条**会静默失败**的硬性要求。
-
-## 为什么单独存在
-
-一个视频节点要能被 OBS 列出并真的投递帧，取决于四件事；它们出问题时没有任何报错：
-节点属性全对、状态显示 `streaming`、格式协商成功，画面就是黑的。四条都已在库内解决，
-细节见 [docs/internals.md](docs/internals.md)：
-
-| 要求 | 缺失时的症状 |
-| --- | --- |
-| 显式声明 `SPA_PARAM_Buffers` | 缓冲区 `maxsize=0`，越界写 / 段错误 |
-| 用 `PW_STREAM_FLAG_TRIGGER` 且**不加** `PW_STREAM_FLAG_DRIVER` | 处处报成功，实际投递 0 帧 |
-| `PW_STREAM_FLAG_MAP_BUFFERS` | `datas[0].data` 不可写 |
-| `media.role = "Production"` | 节点永远不出现在 OBS 下拉框，插件连日志都不打 |
+一个很小的 C++ 静态库：把调用方渲染好的一帧发布成 **PipeWire 视频节点**，在 OBS 里通过
+[obs-pwvideo](https://github.com/tasokait/obs-pwvideo) 选用。它负责注册节点、处理缓冲与帧率
+协商，并在消费者每拉一帧时回调。渲染、布局、文字与网络 I/O 都留在调用方。
 
 ## 接口
-
-公开面只有一个回调和一份配置：
 
 ```cpp
 #include "pwvideo.hpp"
@@ -36,10 +17,10 @@ opt.fpsCap = 30;
 opt.nodeName = "my-overlay";        // OBS 实际连接的名字
 opt.nodeDescription = "My Overlay"; // OBS 下拉框里显示的名字
 opt.appName = "my-overlay-daemon";
-opt.onStreaming = [](bool on) { /* 接入时重置动画时间基等 */ };
+opt.onStreaming = [](bool on) { /* 消费者接入 / 断开 */ };
 
 pwvideo::VideoNode node(opt, [](uint8_t* dst, int stride, int w, int h) {
-  // 按给定 stride 填 w×h 的 BGRA（预乘 alpha）
+  // 按给定 stride 填 w x h 的 BGRA（预乘 alpha）
 });
 
 node.start();
@@ -49,18 +30,20 @@ node.run();   // 阻塞，直到 quit() 或 SIGINT/SIGTERM
 | 方法 | 说明 |
 | --- | --- |
 | `start()` | 连接 PipeWire 并注册节点，失败抛 `std::runtime_error` |
-| `run()` | 阻塞跑主循环；`process` 回调就在这条线程上 |
+| `run()` | 跑 PipeWire 主循环；帧回调就在这条线程上执行 |
 | `quit()` | 让 `run()` 返回，可从任意线程调用 |
-| `stop()` | 停驱动线程并释放资源，析构会自动调用。若 `run()` 正在另一条线程上跑，必须先 `quit()` 并 join 它——PipeWire 要求 stream 的销毁发生在主循环线程上 |
+| `stop()` | 停驱动线程并释放资源，析构会自动调用。若 `run()` 正在另一条线程上跑，先 `quit()` 并 join 它 |
 | `streaming()` | 当前是否有消费者在消费 |
 
-回调契约（同样写在头文件里，因为它**就是**接口）：
+帧回调的契约：
 
-- 在 PipeWire 主循环线程执行，不在你的线程里——共享状态要么加锁，要么传只读快照。
-- 必须写满 `stride × h` 字节的预乘 alpha BGRA。
-- 不许联网、不许阻塞、不许频繁分配：这是每帧热路径。
-- **没有消费者时一次都不会被调用**——0 帧就是 0 开销，别假设它定期跑。
-- 收到的 `w`/`h` 是**协商后**的尺寸，可能与构造时给的相同也可能不同。
+- 在 PipeWire 主循环线程上执行，不在调用方的线程上。
+- 写满 `stride * h` 字节的预乘 alpha BGRA。
+- 不联网、不阻塞、不分配。
+- 没有消费者时不回调。
+- 收到的 `w`/`h` 是协商后的尺寸，可能与配置的尺寸不同。
+
+`Options` 各字段、`onStreaming` 语义与完整契约见 [`src/pwvideo.hpp`](src/pwvideo.hpp)。
 
 ## 构建
 
@@ -69,21 +52,19 @@ make        # -> libpwvideo.a + demo
 make run    # 跑示例节点
 ```
 
-依赖只有发行版系统库：`g++` 与 `libpipewire-0.3`（外加 `pkg-config`）。
+依赖只有发行版系统库：`g++` 与 `libpipewire-0.3`，外加 `pkg-config`。
 
 ## 验证
 
 ```bash
-# 节点在不在、obs-pwvideo 过滤的那三个属性对不对
 pw-dump | grep -A20 pwnode-demo
 
-# 帧是不是真的在流：落盘字节数必须等于 W*H*4*帧数
 gst-launch-1.0 -q pipewiresrc target-object=pwnode-demo num-buffers=10 \
     ! video/x-raw,format=BGRA ! filesink location=/tmp/f.raw
 ```
 
-OBS 侧用 obs-pwvideo 的 **PipeWire Video** 源：下拉框显示 `nodeDescription`，连接用的是
-`nodeName`。源的宽高设成与 `Options::width`/`height` 一致；alpha 原样透传。
+第二条命令落盘的文件大小为 `width * height * 4 * 帧数`。OBS 里把源尺寸设成
+`Options::width`/`Options::height`，alpha 原样透传。
 
 ## 作为子模块使用
 
@@ -92,35 +73,25 @@ git submodule add https://github.com/zlinux-live-util/pw-video-simple-interface.
     lib/pw-video-simple-interface
 ```
 
-消费方用**自己的编译参数**直接编 `lib/pw-video-simple-interface/src/*.cpp`（同一套编译
-单元、没有 ABI 要追），再加 `-I lib/pw-video-simple-interface/src`。也可以就地构建子模块
-自己的 `libpwvideo.a`，但那样会在子模块目录里留下 .o 文件——更好的做法是把源码编进消费方
-自己的构建树。
+消费方用**自己的编译参数**编 `lib/pw-video-simple-interface/src/*.cpp`，并加
+`-I lib/pw-video-simple-interface/src`。也可以就地构建子模块的 `libpwvideo.a`，但会在子模块
+目录里留下 .o 文件。
 
 ## 仓库结构
 
 | 路径 | 内容 |
 | --- | --- |
-| `src/pwvideo.hpp` | 公开接口与回调契约 |
-| `src/pwvideo.cpp` | PipeWire 节点、驱动线程、帧率协商、缓冲区处理 |
-| `examples/demo.cpp` | 最小节点示例（画一根移动的亮条），上面的验证命令就用它 |
-| `docs/internals.md` | 四条硬性要求、各自怎么定位出来的、调试命令 |
-| `Makefile` | `libpwvideo.a` + `demo` |
-
-## 范围
-
-本库**刻意不包含**渲染、布局、文字、HTTP 和 CLI。那些属于调用方：音乐卡片和弹幕悬浮层
-在那一层没有可共享的抽象。
+| `src/pwvideo.hpp` | 公开接口与帧回调契约 |
+| `src/pwvideo.cpp` | PipeWire 节点、驱动线程、缓冲与帧率协商 |
+| `examples/demo.cpp` | 最小示例，上面两条命令就用它 |
+| `docs/internals.md` | 流配置约束及其对应的实测数据 |
+| `Makefile` | `libpwvideo.a` 与 `demo` |
 
 ## 贡献
 
-无论人还是模型写的补丁，都按证据审，不按作者审：
-
-- **行为改动**要给命令和它的输出。
-- **性能结论**要给微基准和实测数据；没有复现路径的数字不进文档。
-- **[docs/internals.md](docs/internals.md) 里的约束不是可商量项**，除非先有 A/B 证据——
-  那四条每一条都花了实打实的调试时间，而且都是静默失败。
-- **说明工作是怎么产出的**（建议而非要求），方便回溯。
+- 行为改动：附命令与其输出。
+- 性能结论：附测量数据。
+- 改流配置前先读 [docs/internals.md](docs/internals.md)。
 
 ## 许可
 

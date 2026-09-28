@@ -1,20 +1,22 @@
-// PipeWire 视频输出实现
+// PipeWire video output.
 //
-// 注册成 media.class = Stream/Output/Video 的节点 —— obs-pwvideo 正好只认这个 class。
+// Registers a node with media.class = Stream/Output/Video, the only class obs-pwvideo accepts.
 //
-// 踩过的四个坑，改之前先看这里：
-//   1) 必须在 pw_stream_update_params() 里声明 SPA_PARAM_Buffers。不声明的话端口上
-//      的 Buffers 参数是空的，PipeWire 不分配内存，process 里拿到的 spa_buffer
-//      全是 maxsize=0，照 stride 盲写会直接踩崩。
-//   2) 用 PW_STREAM_FLAG_TRIGGER（绝不要加 DRIVER）：输出流不会自动调度，必须自己调
-//      pw_stream_trigger_process() 启动图周期。定时器走 PipeWire 主循环不生效，
-//      用独立线程（官方文档推荐的辅助线程做法）。
-//      ⚠️ 加 DRIVER 会静默失效：节点属性更漂亮、状态也是 running、OBS 也报 streaming，
-//         但 process 回调一次都不进，OBS 里一片空白。实测 A/B 过。
-//   3) 需要 PW_STREAM_FLAG_MAP_BUFFERS 才能拿到可写的 datas[0].data。
-//   4) media.role 必须是 "Production"。obs-pwvideo 的 on_registry_global_cb 里写死了
-//      三个 strcmp：media.type=="Video"、media.class=="Stream/Output/Video"、
-//      media.role=="Production"，差一个它的下拉框就看不到这个节点。
+// Four requirements; each of them fails silently when violated. See docs/internals.md for the
+// measurements behind them.
+//   1) SPA_PARAM_Buffers must be declared through pw_stream_update_params(). Without it the
+//      port's Buffers parameter is empty, PipeWire allocates nothing, and every spa_buffer
+//      returned by pw_stream_dequeue_buffer() has maxsize=0, so writing a frame at the given
+//      stride overruns the allocation.
+//   2) Use PW_STREAM_FLAG_TRIGGER and never add PW_STREAM_FLAG_DRIVER. An output stream is not
+//      scheduled automatically and the graph cycle must be started with
+//      pw_stream_trigger_process(). A timer on the PipeWire loop does not work, hence the
+//      driver thread. With DRIVER the node properties and state look correct and the consumer
+//      reports streaming, but the process callback is never entered and no frames arrive.
+//   3) PW_STREAM_FLAG_MAP_BUFFERS is required for datas[0].data to be writable.
+//   4) media.role must be "Production". obs-pwvideo compares media.type == "Video",
+//      media.class == "Stream/Output/Video" and media.role == "Production"; a node missing any
+//      of the three never appears in its source dropdown, and the plugin logs nothing.
 #include "pwvideo.hpp"
 
 #include <pipewire/pipewire.h>
@@ -38,8 +40,8 @@
 namespace pwvideo {
 namespace {
 
-/** pw_init/pw_deinit 是进程级的，必须引用计数：否则第二个 VideoNode 析构时会把第一个
- *  还在用的 PipeWire 全局状态拆掉。 */
+// pw_init/pw_deinit operate on process-global state and are therefore reference counted: two
+// VideoNode instances must not tear down each other's state on destruction.
 std::mutex gInitMu;
 int gInitCount = 0;
 
@@ -71,9 +73,9 @@ struct VideoNode::Impl {
 
   std::atomic<int> negW{0};
   std::atomic<int> negH{0};
-  std::atomic<int> negFps{0};  // 协商出来的帧率（消费者可以要得更低）
+  std::atomic<int> negFps{0};  // Negotiated frame rate; a consumer may request a lower one.
 
-  /** 把一帧写进 PipeWire 缓冲；按 maxsize 校验，绝不越界 */
+  // Writes one frame into a PipeWire buffer. Validated against maxsize, never overruns.
   void produce() {
     pw_buffer* b = pw_stream_dequeue_buffer(stream);
     if (!b) return;
@@ -97,10 +99,10 @@ struct VideoNode::Impl {
         }
         const uint64_t n = frames.fetch_add(1, std::memory_order_relaxed) + 1;
         if (opt.verbose && (n % 60) == 1)
-          std::fprintf(stderr, "[pw] 已推送 %llu 帧 (%dx%d)\n",
+          std::fprintf(stderr, "[pw] pushed %llu frames (%dx%d)\n",
                        static_cast<unsigned long long>(n), w, h);
       } else if (opt.verbose) {
-        std::fprintf(stderr, "[pw] 跳过一帧：maxsize=%u < need=%zu\n", d.maxsize, need);
+        std::fprintf(stderr, "[pw] frame skipped: maxsize=%u < need=%zu\n", d.maxsize, need);
       }
     }
     pw_stream_queue_buffer(stream, b);
@@ -121,18 +123,16 @@ struct VideoNode::Impl {
       if (r > 0) negFps.store(r);
     }
     if (opt.verbose)
-      std::fprintf(stderr, "[pw] 协商格式 %ux%u format=%d framerate=%u/%u\n",
+      std::fprintf(stderr, "[pw] negotiated %ux%u format=%d framerate=%u/%u\n",
                    info.size.width, info.size.height, static_cast<int>(info.format),
                    info.framerate.num, info.framerate.denom);
   }
 
-  /**
-   * 作为 TRIGGER 流，必须自己按目标帧率启动图周期。
-   * 注意 process 本身只在 STREAMING 状态下才应该触发。
-   */
+  // A TRIGGER stream starts its own graph cycles at the target rate. The process callback is
+  // only meaningful while the stream is in STREAMING.
   void driverLoop(pw_stream* st) {
     const int cap = opt.fpsCap > 0 ? opt.fpsCap : 30;
-    const int floorFps = std::min(5, cap);  // 消费者要得太低时保底，别把画面冻住
+    const int floorFps = std::min(5, cap);  // Keep the picture moving if a consumer asks for less.
     auto next = std::chrono::steady_clock::now();
     uint64_t n = 0;
     while (driveRunning.load(std::memory_order_relaxed)) {
@@ -141,8 +141,9 @@ struct VideoNode::Impl {
       rate = std::clamp(rate, floorFps, cap);
       next += std::chrono::nanoseconds(1000000000LL / rate);
       const auto state = pw_stream_get_state(st, nullptr);
-      // 不查 is_driving()：消费者（OBS）也在图里，谁被选成 driver 由 WirePlumber 决定，
-      // 但数据是我们产的，只要流进了 STREAMING 就该由我们推进图周期。
+      // is_driving() is deliberately not consulted: the consumer (OBS) is part of the graph
+      // too, and which end WirePlumber selects as driver must not decide whether this end
+      // produces frames. Entering STREAMING is the only condition.
       if (state == PW_STREAM_STATE_STREAMING) pw_stream_trigger_process(st);
       if (opt.verbose && (++n % 30) == 1)
         std::fprintf(stderr, "[pw] tick %llu state=%d driving=%d\n",
@@ -154,9 +155,9 @@ struct VideoNode::Impl {
 
   void onState(pw_stream_state state, const char* err) {
     if (opt.verbose)
-      std::fprintf(stderr, "[pw] 状态 -> %d %s\n", static_cast<int>(state), err ? err : "");
+      std::fprintf(stderr, "[pw] state -> %d %s\n", static_cast<int>(state), err ? err : "");
     if (state == PW_STREAM_STATE_ERROR && err)
-      std::fprintf(stderr, "[pw] 流错误: %s\n", err);
+      std::fprintf(stderr, "[pw] stream error: %s\n", err);
 
     const bool nowStreaming = (state == PW_STREAM_STATE_STREAMING);
     if (nowStreaming != streamingFlag.exchange(nowStreaming) && opt.onStreaming)
@@ -193,10 +194,10 @@ struct VideoNode::Impl {
 
 VideoNode::VideoNode(Options opt, FrameProvider provider) : impl_(std::make_unique<Impl>()) {
   if (opt.width <= 0 || opt.height <= 0)
-    throw std::runtime_error("VideoNode: width/height 必须为正");
+    throw std::runtime_error("VideoNode: width/height must be positive");
   impl_->opt = std::move(opt);
   impl_->provider = std::move(provider);
-  if (!impl_->provider) throw std::runtime_error("VideoNode: provider 不能为空");
+  if (!impl_->provider) throw std::runtime_error("VideoNode: provider must be set");
 }
 
 VideoNode::~VideoNode() { stop(); }
@@ -208,33 +209,35 @@ void VideoNode::start() {
   s.loop = pw_main_loop_new(nullptr);
   if (!s.loop) {
     pwInitRelease();
-    throw std::runtime_error("pw_main_loop_new 失败");
+    throw std::runtime_error("pw_main_loop_new failed");
   }
   pw_loop* l = pw_main_loop_get_loop(s.loop);
   if (s.opt.handleSignals) {
-    // 经 pw_loop_add_signal 处理：退出动作在主循环里做，不在信号上下文里做。
+    // Handled through pw_loop_add_signal: the exit runs on the main loop, not in signal
+    // context.
     pw_loop_add_signal(l, SIGINT, &Impl::onSignal, s.loop);
     pw_loop_add_signal(l, SIGTERM, &Impl::onSignal, s.loop);
   }
 
   s.context = pw_context_new(l, nullptr, 0);
-  if (!s.context) throw std::runtime_error("pw_context_new 失败");
+  if (!s.context) throw std::runtime_error("pw_context_new failed");
   s.core = pw_context_connect(s.context, nullptr, 0);
-  if (!s.core) throw std::runtime_error("连接 PipeWire 失败（daemon 没在跑？）");
+  if (!s.core) throw std::runtime_error("cannot connect to PipeWire (is the daemon running?)");
 
   pw_properties* props = pw_properties_new(
       PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture",
-      // media.role 必须是 "Production"：obs-pwvideo 的 on_registry_global_cb 里
-      // 写死了三个 strcmp —— media.type=="Video"、media.class=="Stream/Output/Video"、
-      // media.role=="Production"，差一个它的下拉框就看不到这个节点。
+      // media.role must be "Production": obs-pwvideo's on_registry_global_cb compares
+      // media.type == "Video", media.class == "Stream/Output/Video" and
+      // media.role == "Production", and a node missing any of the three never appears in its
+      // dropdown.
       PW_KEY_MEDIA_ROLE, "Production",
-      PW_KEY_MEDIA_CLASS, "Stream/Output/Video",  // obs-pwvideo 只认这个
+      PW_KEY_MEDIA_CLASS, "Stream/Output/Video",  // The only class obs-pwvideo accepts.
       PW_KEY_NODE_NAME, s.opt.nodeName.c_str(), PW_KEY_NODE_DESCRIPTION,
       s.opt.nodeDescription.c_str(), PW_KEY_NODE_NICK, s.opt.nodeDescription.c_str(),
       PW_KEY_APP_NAME, s.opt.appName.c_str(), nullptr);
 
   s.stream = pw_stream_new_simple(l, s.opt.nodeName.c_str(), props, &Impl::events(), &s);
-  if (!s.stream) throw std::runtime_error("pw_stream_new_simple 失败");
+  if (!s.stream) throw std::runtime_error("pw_stream_new_simple failed");
 
   uint8_t formatBuf[1024];
   spa_pod_builder fb = SPA_POD_BUILDER_INIT(formatBuf, sizeof(formatBuf));
@@ -242,7 +245,7 @@ void VideoNode::start() {
   {
     spa_rectangle size{static_cast<uint32_t>(s.opt.width),
                        static_cast<uint32_t>(s.opt.height)};
-    // 帧率声明成区间：上限由 fpsCap 决定，消费者可以要得更低但不可能更高。
+    // The frame rate is advertised as a range: consumers may negotiate lower, never higher.
     const int cap = s.opt.fpsCap > 0 ? s.opt.fpsCap : 30;
     spa_fraction fr{static_cast<uint32_t>(cap), 1};
     spa_fraction frMin{static_cast<uint32_t>(std::max(1, cap / 4)), 1};
@@ -250,7 +253,7 @@ void VideoNode::start() {
     spa_pod_builder_add(&fb, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video), 0);
     spa_pod_builder_add(&fb, SPA_FORMAT_mediaSubtype,
                         SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), 0);
-    // 只要 BGRA：cairo 的 ARGB32 在小端就是 B,G,R,A，可以整块拷
+    // BGRA only: cairo's ARGB32 is B,G,R,A on little-endian, so a frame can be copied as is.
     spa_pod_builder_add(&fb, SPA_FORMAT_VIDEO_format,
                         SPA_POD_Id(SPA_VIDEO_FORMAT_BGRA), 0);
     spa_pod_builder_add(&fb, SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&size), 0);
@@ -259,16 +262,16 @@ void VideoNode::start() {
   }
   const spa_pod* params[1] = {static_cast<spa_pod*>(spa_pod_builder_pop(&fb, &ff))};
 
-  // 只用 TRIGGER，绝对不要加 DRIVER。
-  // 实测（OBS 当消费者）：TRIGGER → 帧正常投递；加 DRIVER → 节点属性更好看、
-  // 状态也是 running，但 process 回调一次都不进，OBS 里就是一片空白。
-  // 节点可见性和这个标志无关，靠 media.role="Production"。见 docs/internals.md。
+  // TRIGGER only; DRIVER must not be added. Measured with OBS as the consumer: TRIGGER delivers
+  // frames, while adding DRIVER leaves the properties and state looking correct but never
+  // enters the process callback. Node visibility does not depend on this flag; it comes from
+  // media.role="Production".
   const pw_stream_flags flags = static_cast<pw_stream_flags>(
       PW_STREAM_FLAG_MAP_BUFFERS | PW_STREAM_FLAG_TRIGGER);
   if (pw_stream_connect(s.stream, PW_DIRECTION_OUTPUT, PW_ID_ANY, flags, params, 1) < 0)
-    throw std::runtime_error("pw_stream_connect 失败");
+    throw std::runtime_error("pw_stream_connect failed");
 
-  // 声明缓冲区需求（见文件头坑 1）
+  // Declare the buffer requirements (requirement 1 in the file header).
   {
     const int frameBytes = s.opt.width * s.opt.height * 4;
     const int stride = s.opt.width * 4;
