@@ -2,10 +2,14 @@
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
-A small C++ static library that publishes a caller-rendered frame as a **PipeWire video node**,
+A small C++ library that publishes a caller-rendered frame as a **PipeWire video node**,
 selectable in OBS through [obs-pwvideo](https://github.com/tasokait/obs-pwvideo). It registers
 the node, handles buffer and frame-rate negotiation, and calls back for each frame a consumer
-pulls. Rendering, layout, text and network I/O stay with the caller.
+pulls. Layout, text and network I/O stay with the caller.
+
+Alongside the core sits an optional set of cairo-level helpers: a frame that bridges to the
+provider buffer, text drawn with an outline, an image cache and an HTTP client. They exist
+because every overlay written on top of this node otherwise re-derives the same code.
 
 ## API
 
@@ -47,14 +51,48 @@ The frame callback contract:
 `Options` fields, `onStreaming` semantics and the full contract are documented in
 [`src/pwvideo.hpp`](src/pwvideo.hpp).
 
+## Modules
+
+| Header | Contents | Dependencies |
+| --- | --- | --- |
+| `src/pwvideo.hpp` | `VideoNode`, `Options`, `FrameProvider`: the node itself | libpipewire |
+| `extras/cairo_util.hpp` | `SurfacePtr`/`ContextPtr`, `CairoFrame` (surface plus context, `blitTo`, `writePng`), `roundedRect`, `Rgba` | cairo |
+| `extras/text.hpp` | `TextRenderer`: one reusable pango layout, fill and glyph-path outline | cairo, pangocairo |
+| `extras/assetcache.hpp` | `AssetCache`: URL to cairo surface, LRU, `Cover` and `Contain` scaling | cairo, gdk-pixbuf, libcurl |
+| `extras/http.hpp` | `HttpClient`: one reusable curl handle, byte cap, `file://` support | libcurl |
+
+`CairoFrame::blitTo` takes the provider's `dst`, `stride`, `w` and `h` unchanged, so a consumer
+never copies the stride handling. `TextRenderer::outline` strokes the glyph path and is meant to
+be called before `fill`, twice with decreasing widths for a soft shadow, which is what keeps
+text readable over video.
+
+```cpp
+#include "cairo_util.hpp"
+#include "text.hpp"
+
+pwvideo::CairoFrame frame(480, 200);      // ARGB32, premultiplied
+pwvideo::TextRenderer text;
+
+cairo_t* cr = frame.cr();
+PangoLayout* l = text.layout(cr, "message", pwvideo::LabelSpec{30, true, 300, 1, true, false});
+pwvideo::TextRenderer::outline(cr, l, 16, 60, 4.0, pwvideo::Rgba{0, 0, 0, 0.6}, 1.5);
+pwvideo::TextRenderer::fill(cr, l, 16, 60, pwvideo::Rgba{1, 1, 1, 1});
+
+// inside the frame callback:
+frame.blitTo(dst, stride, w, h);
+```
+
 ## Build
 
 ```bash
-make        # -> libpwvideo.a + demo
+make        # -> libpwvideo.a + demo, and libpwvideo-cairo.a + demo-cairo
 make run    # runs the demo node
+./demo-cairo --dump /tmp/extras.png --image file:///path/to/image.png
 ```
 
-Dependencies are distribution libraries only: `g++` and `libpipewire-0.3`, plus `pkg-config`.
+The core needs `g++`, `libpipewire-0.3` and `pkg-config`. The extras are built only when
+`cairo`, `pangocairo`, `gdk-pixbuf-2.0` and `libcurl` are present; without them `make` builds
+the core and says so.
 
 ## Verify
 
@@ -75,9 +113,17 @@ git submodule add https://github.com/zlinux-live-util/pw-video-simple-interface.
     lib/pw-video-simple-interface
 ```
 
-Consumers compile `lib/pw-video-simple-interface/src/*.cpp` with their own flags and add
-`-I lib/pw-video-simple-interface/src`. Building the submodule's own `libpwvideo.a` in place
-also works, but leaves object files inside the submodule directory.
+Consumers compile the sources with their own flags and add the two include paths:
+
+```make
+PWNODE := lib/pw-video-simple-interface
+PWNODE_SRC := $(wildcard $(PWNODE)/src/*.cpp) $(wildcard $(PWNODE)/extras/*.cpp)
+CXXFLAGS += -I$(PWNODE)/src -I$(PWNODE)/extras
+```
+
+Drop `$(PWNODE)/extras/*.cpp` and its include path when only the video node is wanted. Building
+the submodule's own `libpwvideo.a` in place also works, but leaves object files inside the
+submodule directory.
 
 ## Repository layout
 
@@ -85,9 +131,14 @@ also works, but leaves object files inside the submodule directory.
 | --- | --- |
 | `src/pwvideo.hpp` | Public API and frame callback contract |
 | `src/pwvideo.cpp` | PipeWire node, driver thread, buffer and frame-rate negotiation |
-| `examples/demo.cpp` | Minimal node used by the commands above |
+| `extras/cairo_util.{hpp,cpp}` | Surface and context wrappers, `CairoFrame`, `roundedRect` |
+| `extras/text.{hpp,cpp}` | Pango layout reuse, fill and glyph-path outline |
+| `extras/assetcache.{hpp,cpp}` | URL to cairo surface with an LRU, `Cover` and `Contain` |
+| `extras/http.{hpp,cpp}` | HTTP(S) GET client over one reusable curl handle |
+| `examples/demo.cpp` | Minimal node used by the verify commands |
+| `examples/demo-cairo.cpp` | The extras end to end: frame, outline text, cached image |
 | `docs/internals.md` | Stream setup constraints and the measurements behind them |
-| `Makefile` | `libpwvideo.a` and `demo` |
+| `Makefile` | `libpwvideo.a`, `libpwvideo-cairo.a`, `demo`, `demo-cairo` |
 
 ## Contributing
 

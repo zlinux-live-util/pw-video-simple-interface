@@ -1,5 +1,7 @@
-# 构建产物
+# Build artifacts
 *.o
 *.d
 /libpwvideo.a
+/libpwvideo-cairo.a
 /demo
+/demo-cairo
