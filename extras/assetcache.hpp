@@ -18,7 +18,9 @@ enum class ScaleMode {
 };
 
 struct AssetSpec {
-  int width = 0;                 // 0 with height 0 keeps the decoded size
+  /** Target box. Width and height both 0 keeps the decoded size; if exactly one of them is 0 the
+   *  other dimension is derived from the source aspect ratio, so the scale stays uniform. */
+  int width = 0;
   int height = 0;
   ScaleMode mode = ScaleMode::Cover;
 };
